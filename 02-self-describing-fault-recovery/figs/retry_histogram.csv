@@ -1,4 +1,0 @@
-retries,count,rate,note
-1,160,0.5333333333333333,toy simulated (Python); not production telemetry
-2,104,0.3466666666666667,toy simulated (Python); not production telemetry
-3,36,0.12,toy simulated (Python); not production telemetry

@@ -1,0 +1,16 @@
+kind,policy,final_action,count,ratio
+degraded,blind_retry,blind_retry,194,0.97
+degraded,blind_retry,none_needed,6,0.03
+degraded,blind_retry_no_dedup,blind_retry,194,0.97
+degraded,blind_retry_no_dedup,none_needed,6,0.03
+degraded,none,none_needed,200,1.0
+degraded,self_describing,degrade_migrate,200,1.0
+fatal,blind_retry,blind_retry,199,0.995
+fatal,blind_retry,none_needed,1,0.005
+fatal,none,fail,200,1.0
+fatal,self_describing,isolate_recover,200,1.0
+transient,blind_retry,blind_retry,63,0.315
+transient,blind_retry,fail,137,0.685
+transient,none,fail,200,1.0
+transient,self_describing,retry,182,0.91
+transient,self_describing,retry_exhausted_isolate,18,0.09

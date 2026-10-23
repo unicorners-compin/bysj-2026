@@ -18,6 +18,7 @@
 python3 -m src.experiment
 ```
 
-生成。全部为 **本科友好的 Python 玩具仿真**（参数扫描 / 蒙特卡洛），**不是** DPDK、硬件或生产集群实测。论文引用时请标明「仿真示意」。
+生成（固定随机种子，可复现）。全部为 **Python 教学原型**：01 使用在 MNIST 上真实训练的两出口 CNN 的出口输出 + 单机网络仿真；
+02、03 为单进程事件驱动 / 离散事件仿真。**不是** DPDK、硬件或生产集群实测。论文引用时请标明「教学原型仿真」。
 
-依赖：`matplotlib`、`numpy`（见各目录 `requirements.txt`）。
+依赖：`matplotlib`、`numpy`（见各目录 `requirements.txt`）；01 的 `src.train` 另需 `torch`（CPU 即可）。

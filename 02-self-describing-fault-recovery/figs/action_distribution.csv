@@ -1,5 +1,0 @@
-kind,final_action,count,rate,note
-degraded,degrade,300,1.0,toy simulated (Python); not production telemetry
-fatal,isolate,300,1.0,toy simulated (Python); not production telemetry
-transient,isolate,40,0.13333333333333333,toy simulated (Python); not production telemetry
-transient,recovered_after_retry,260,0.8666666666666667,toy simulated (Python); not production telemetry
