@@ -1,0 +1,4 @@
+policy,alpha,beta,n_trials,n_tasks,mean_avg_score,std_avg_score,mean_comm_load_std,std_comm_load_std,eval_alpha,eval_beta,note
+cpu_only,1.0,0.0,200,8,0.5226149356420078,0.08541872567217806,0.2433859719123522,0.07137037130218928,0.4,0.6,toy simulated (Python); not real cluster traces
+comm_aware,0.4,0.6,200,8,0.47054792142761726,0.07661380332099085,0.11509476161345741,0.0402230831336481,0.4,0.6,toy simulated (Python); not real cluster traces
+balanced,0.5,0.5,200,8,0.4719577892928445,0.0766451862594774,0.13778934150321562,0.04420589198075598,0.4,0.6,toy simulated (Python); not real cluster traces

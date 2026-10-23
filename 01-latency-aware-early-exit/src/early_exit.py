@@ -50,3 +50,19 @@ def demo_stages(seed: int = 0):
             return lambda: (c, lab, cst)
         out.append(make())
     return out
+
+
+def random_stages(rng, n_stages: int = 4):
+    """Toy multi-stage pipeline: confidence rises, cost grows (simulated)."""
+    import random
+    assert isinstance(rng, random.Random)
+    base_conf = rng.uniform(0.35, 0.55)
+    stages = []
+    for i in range(n_stages):
+        conf = min(0.99, base_conf + i * rng.uniform(0.12, 0.22) + rng.uniform(-0.03, 0.03))
+        cost = rng.uniform(5.0, 10.0) + i * rng.uniform(6.0, 12.0)
+        label = f"stage{i+1}"
+        def make(c=conf, lab=label, cst=cost):
+            return lambda: (c, lab, cst)
+        stages.append(make())
+    return stages

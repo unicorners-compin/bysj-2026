@@ -1,0 +1,10 @@
+budget_ms,success_rate,mean_exit_stage,mean_latency_ms,n_trials,note
+10,0.0,1.0,7.395752238203982,200,toy simulated (Python); not hardware / DPDK
+15,0.0,1.0,7.491023158111011,200,toy simulated (Python); not hardware / DPDK
+20,0.0,1.065,8.3638156861014,200,toy simulated (Python); not hardware / DPDK
+25,0.0,1.58,16.785538896003974,200,toy simulated (Python); not hardware / DPDK
+30,0.0,1.985,23.95920306106426,200,toy simulated (Python); not hardware / DPDK
+40,0.01,2.025,24.492428850792113,200,toy simulated (Python); not hardware / DPDK
+50,0.165,2.585,37.420431203124345,200,toy simulated (Python); not hardware / DPDK
+70,0.255,3.01,50.097400163703696,200,toy simulated (Python); not hardware / DPDK
+100,0.83,3.735,75.0660536714684,200,toy simulated (Python); not hardware / DPDK

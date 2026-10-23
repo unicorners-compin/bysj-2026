@@ -1,0 +1,8 @@
+confidence_threshold,budget_ms,mean_latency_ms,mean_exit_stage,n_trials,note
+0.55,50.0,25.552760983417883,2.055,200,toy simulated (Python); not hardware / DPDK
+0.65,50.0,31.89515810824702,2.34,200,toy simulated (Python); not hardware / DPDK
+0.75,50.0,34.698428027713234,2.46,200,toy simulated (Python); not hardware / DPDK
+0.8,50.0,35.85522193106774,2.52,200,toy simulated (Python); not hardware / DPDK
+0.85,50.0,35.947436707431734,2.52,200,toy simulated (Python); not hardware / DPDK
+0.9,50.0,35.18296622600555,2.48,200,toy simulated (Python); not hardware / DPDK
+0.95,50.0,36.63350011440217,2.53,200,toy simulated (Python); not hardware / DPDK

@@ -10,4 +10,14 @@
 
 每个子目录均可独立运行：进入目录后见各自 `README.md`。
 
-说明：仿真与数值为教学原型，正式实验数据请用实测替换。
+## 仿真与图
+
+各课题 `figs/` 下的 CSV/PNG 由对应目录内：
+
+```bash
+python3 -m src.experiment
+```
+
+生成。全部为 **本科友好的 Python 玩具仿真**（参数扫描 / 蒙特卡洛），**不是** DPDK、硬件或生产集群实测。论文引用时请标明「仿真示意」。
+
+依赖：`matplotlib`、`numpy`（见各目录 `requirements.txt`）。
