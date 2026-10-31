@@ -1,0 +1,7 @@
+combo,strategy,completed,consistent,digest,makespan_s,ckpt_MB,recovery_load_MB,state_transfer_MB,duplicate_compute_s,reexec_stages,stage_runs,dup_intercepted,final_count
+light,recompute,1,1,693cd5649dfcda03,0.30515,0.0,0.0,0.0,0.0,0,9,0,3
+light,per_stage,1,1,693cd5649dfcda03,0.29936,0.41677,0.0,0.41677,0.0,0,9,0,3
+light,selective,1,1,693cd5649dfcda03,0.30065,0.41677,0.0,0.41677,0.0,0,9,0,3
+heavy,recompute,1,1,693cd5649dfcda03,0.3239,0.0,0.0,0.0,0.0,0,9,0,3
+heavy,per_stage,1,1,693cd5649dfcda03,0.30152,13656.86221,0.0,13656.86221,0.0,0,9,0,3
+heavy,selective,1,1,693cd5649dfcda03,0.30591,0.0,0.0,0.0,0.0,0,9,0,3

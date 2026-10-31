@@ -4,7 +4,7 @@ Single-process discrete-event simulation (simulated clock, not wall clock).  Sta
 outputs are *really computed* (src.task) so that the final result digest of every
 faulty run can be compared with a fault-free reference; only time is simulated.
 
-State-saving strategies : recompute | per_stage | selective(lambda)
+State-saving strategies : recompute | per_stage | selective(lambda), via policy.should_save
 Recovery policies       : none | blind_retry | self_describing
 Fault kinds             : fatal (crash) | transient (retryable error) | degraded (slow node)
 """
@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from .fault import FaultDesc, FaultKind, plan_recovery
+from .policy import should_save as policy_should_save
 from .task import Combo, Data, TaskDesc, global_digest, make_partition, run_stage, stage_cost_s
 
 N_STAGES = 3
@@ -203,12 +204,7 @@ class Sim:
         self.push(self.t + delay, "msg_arrive", wid, op, w.busy, stage, kind, out, acc)
 
     def should_save(self, acc_compute, nbytes):
-        s = self.cfg.strategy
-        if s == "recompute":
-            return False
-        if s == "per_stage":
-            return True
-        return acc_compute >= self.cfg.lam * (nbytes / self.cfg.bw + self.cfg.s0)
+        return policy_should_save(self.cfg.strategy, self.cfg.lam, acc_compute, nbytes, self.cfg.bw, self.cfg.s0)
 
     def on_msg_arrive(self, wid, op, busy, stage, kind, out, acc):
         tid = busy[0]

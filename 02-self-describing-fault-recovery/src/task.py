@@ -60,6 +60,7 @@ class TaskDesc:
     attempt: int = 0
     saved_stages: Tuple[int, ...] = ()
     checksum: str = ""
+    needed_refs: Tuple[str, ...] = ()  # intermediates required to (re)start; usually (input_ref,)
 
     def next_attempt(self, stage_id: int, input_ref: str) -> "TaskDesc":
         return replace(self, stage_id=stage_id, input_ref=input_ref, attempt=self.attempt + 1)
