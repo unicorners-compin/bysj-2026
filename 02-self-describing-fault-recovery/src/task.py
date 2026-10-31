@@ -33,8 +33,9 @@ class Combo:
     filter_cost_us: float
     transform_cost_us: float
     aggregate_cost_us: float
-    pad_bytes: int              # padding carried by every record after filter/transform
+    pad_bytes: int              # logical padding for the simulator; not allocated
     desc: str = ""
+    wire_payload: int = 0       # real bytes/record carried in multiprocess checkpoints
 
     def plan(self) -> Tuple[StageSpec, ...]:
         return (StageSpec("filter", self.filter_cost_us), StageSpec("transform", self.transform_cost_us),
@@ -60,6 +61,7 @@ class TaskDesc:
     attempt: int = 0
     saved_stages: Tuple[int, ...] = ()
     checksum: str = ""
+    needed_refs: Tuple[str, ...] = ()  # intermediates required to (re)start; usually (input_ref,)
 
     def next_attempt(self, stage_id: int, input_ref: str) -> "TaskDesc":
         return replace(self, stage_id=stage_id, input_ref=input_ref, attempt=self.attempt + 1)
@@ -70,16 +72,19 @@ class Data:
     key: np.ndarray
     val: np.ndarray
     pad: int
+    extra: Optional[np.ndarray] = None  # real payload pickled with multiprocess checkpoints
 
     @property
     def nbytes(self) -> int:
+        """Logical size used by the single-process simulator (includes unallocated pad)."""
         return int(len(self.key) * (BASE_RECORD_BYTES + self.pad))
 
 
 def make_partition(task_idx: int, combo: Combo, seed: int) -> Data:
     rng = np.random.default_rng(seed * 100003 + task_idx)
     n = combo.records_per_task
-    return Data(rng.integers(0, N_KEYS, n), rng.normal(0.0, 1.0, n), 0)
+    extra = np.zeros((n, combo.wire_payload), dtype=np.uint8) if combo.wire_payload else None
+    return Data(rng.integers(0, N_KEYS, n), rng.normal(0.0, 1.0, n), 0, extra)
 
 
 def digest_data(d: Data) -> str:
@@ -91,16 +96,17 @@ def digest_data(d: Data) -> str:
 def run_stage(i: int, d: Data, combo: Combo) -> Data:
     if i == 0:   # filter: keep records with value > -0.1 (about 54 %)
         m = d.val > -0.1
-        return Data(d.key[m], d.val[m], combo.pad_bytes)
+        extra = None if d.extra is None else d.extra[m]
+        return Data(d.key[m], d.val[m], combo.pad_bytes, extra)
     if i == 1:   # transform: deterministic numeric map
         v = d.val
         for _ in range(3):
             v = np.tanh(v * 1.5) + 0.1 * v * v
-        return Data(d.key, v, combo.pad_bytes)
-    # aggregate: per-key sum and count
+        return Data(d.key, v, combo.pad_bytes, d.extra)
+    # aggregate: per-key sum and count; the bulk payload is not part of the final vector
     s = np.bincount(d.key, weights=d.val, minlength=N_KEYS)
     c = np.bincount(d.key, minlength=N_KEYS).astype(np.float64)
-    return Data(np.arange(N_KEYS), np.concatenate([s, c]), 0)
+    return Data(np.arange(N_KEYS), np.concatenate([s, c]), 0, None)
 
 
 def stage_cost_s(i: int, n_in: int, combo: Combo) -> float:

@@ -1,0 +1,7 @@
+combo,strategy,n,completion_rate,recovery_time_s_mean,recovery_time_s_std,duplicate_compute_s_mean,duplicate_compute_s_std,state_transfer_MB_mean,state_transfer_MB_std,ckpt_MB_mean,dup_intercepted_mean,reexec_stages_mean,ff_state_transfer_MB,ff_makespan_s
+light,recompute,4,1.0,0.25812,0.00943,0.08064,0.00049,0.0,0.0,0.0,1.0,1.0,0.0,0.29414
+light,per_stage,4,1.0,0.18102,0.0025,0.00182,0.00215,0.24426,0.0,0.21005,0.0,0.0,0.21005,0.30016
+light,selective,4,1.0,0.17775,0.00927,0.00061,0.0004,0.24426,0.0,0.21005,0.0,0.0,0.21005,0.30227
+heavy,recompute,4,1.0,0.28221,0.00466,0.08042,0.00018,0.0,0.0,0.0,1.0,1.0,0.0,0.37595
+heavy,per_stage,4,1.0,0.19673,0.00891,0.00093,0.00049,31.26179,0.0,26.88368,0.0,0.0,26.88368,0.37749
+heavy,selective,4,1.0,0.2856,0.00427,0.08167,0.00161,0.0,0.0,0.0,1.0,1.0,0.0,0.33137
