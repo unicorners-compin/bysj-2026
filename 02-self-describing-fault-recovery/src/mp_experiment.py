@@ -31,9 +31,11 @@ N_WORKERS = 4
 N_TASKS = 3
 REPS = 4
 MIN_STAGE_S = 0.08
+# Heavy checkpoints carry 2048 real bytes per surviving record (~4 MB each).
+# Three tasks × two saved stages stay in the tens of MB once pickled.
 COMBOS = {
-    "light": Combo("light", 4000, 5.0, 10.0, 2.0, 16, "状态小"),
-    "heavy": Combo("heavy", 4000, 5.0, 10.0, 2.0, 1_048_576, "状态大"),
+    "light": Combo("light", 4000, 5.0, 10.0, 2.0, 16, "状态小", wire_payload=0),
+    "heavy": Combo("heavy", 4000, 5.0, 10.0, 2.0, 16, "状态大", wire_payload=2048),
 }
 FOOT = "多进程原型：1 个协调进程 + 4 个工作进程，运行中 SIGKILL 一个工作进程；阶段为真实 numpy，恢复时间为墙钟"
 
@@ -214,7 +216,7 @@ def figs(summary):
     fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2))
     panels = (
         (axes[0], "duplicate_compute_s_mean", "duplicate_compute_s_std", "重复计算 (墙钟秒)", "重复计算（重做阶段 + 被杀死的部分）"),
-        (axes[1], "state_transfer_MB_mean", "state_transfer_MB_std", "状态传输量 (MB)", "状态传输量（检查点 + 恢复装载，逻辑字节）"),
+        (axes[1], "state_transfer_MB_mean", "state_transfer_MB_std", "状态传输量 (MB)", "状态传输量（检查点 + 恢复装载，序列化字节）"),
     )
     for ax, key, err, ylabel, title in panels:
         for j, strategy in enumerate(STRATS):

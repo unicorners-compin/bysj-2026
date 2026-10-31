@@ -9,12 +9,12 @@ import signal
 
 import numpy as np
 
-from src.mp_runtime import ConfirmLog, KillSpec, MpCfg, run_job
+from src.mp_runtime import ConfirmLog, KillSpec, MpCfg, queued_bytes, run_job
 from src.policy import should_save
 from src.task import N_KEYS, Combo, Data, global_digest, make_partition, run_stage
 
 LIGHT = Combo("L", 1200, 5.0, 10.0, 2.0, 16, "轻")
-HEAVY = Combo("H", 1200, 5.0, 10.0, 2.0, 2_000_000, "状态大")
+HEAVY = Combo("H", 200, 5.0, 10.0, 2.0, 16, "状态大", wire_payload=8192)
 
 
 def test_should_save_recompute_per_stage_and_selective():
@@ -78,14 +78,33 @@ def test_fault_free_matches_sequential_and_strategies():
     assert len(set(digests)) == 1
 
 
+def test_state_transfer_counts_pickled_bytes_not_logical_pad():
+    """Huge unallocated pad must not show up in the transfer metric."""
+    padded = Combo("pad", 40, 5.0, 10.0, 2.0, 8_000_000, "仅逻辑填充")
+    result = run_job(padded, MpCfg(strategy="per_stage", n_workers=3, n_tasks=1, min_stage_s=0,
+                                   data_seed=0, timeout_s=20))
+    data = make_partition(0, padded, 0)
+    expect = 0
+    logical = 0
+    for stage in range(2):
+        data = run_stage(stage, data, padded)
+        expect += queued_bytes(data)
+        logical += data.nbytes
+    assert result["ckpt_bytes"] == expect
+    assert logical > result["ckpt_bytes"] * 50
+    assert result["ckpt_bytes"] < 100_000
+
+
 def test_heavy_state_selective_keeps_less_than_per_stage():
     common = dict(n_workers=3, n_tasks=2, min_stage_s=0, data_seed=1, lam=1.0, timeout_s=20)
+    light = run_job(LIGHT, MpCfg(strategy="per_stage", **common))
     recomputed = run_job(HEAVY, MpCfg(strategy="recompute", **common))
     per_stage = run_job(HEAVY, MpCfg(strategy="per_stage", **common))
     selective = run_job(HEAVY, MpCfg(strategy="selective", **common))
     assert recomputed["ckpt_bytes"] == 0
     assert selective["ckpt_bytes"] == 0
-    assert per_stage["ckpt_bytes"] > 0
+    assert per_stage["ckpt_bytes"] > light["ckpt_bytes"] * 5
+    assert per_stage["ckpt_bytes"] < 20_000_000
     assert recomputed["digest"] == per_stage["digest"] == selective["digest"]
 
 

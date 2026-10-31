@@ -17,6 +17,7 @@ import os
 import signal
 import threading
 import time
+from multiprocessing.reduction import ForkingPickler
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from queue import Empty
@@ -28,6 +29,15 @@ from .policy import should_save
 from .task import N_KEYS, Combo, Data, TaskDesc, digest_data, global_digest, make_partition, run_stage, stage_cost_s
 
 N_STAGES = 3
+
+
+def queued_bytes(obj) -> int:
+    """Length of the pickle Queue puts on the pipe for this object.
+
+    multiprocessing uses ForkingPickler. The checkpoint body is what moves;
+    unallocated simulator padding is not part of ``Data`` and is not counted.
+    """
+    return len(ForkingPickler.dumps(obj))
 
 
 @dataclass(frozen=True)
@@ -146,12 +156,13 @@ def _worker_main(wid, in_q, out_q, combo: Combo, cfg: MpCfg, cur_task, cur_stage
                         out_q.put(("bye", wid))
                         return
                     break
-                nbytes = out.nbytes
-                if should_save(cfg.strategy, cfg.lam, acc, nbytes, cfg.bw, cfg.s0):
-                    out_q.put(("ckpt", wid, desc.task_id, stage, out, dt, cost, nbytes))
+                # P_k uses the bytes that would actually be pickled, not logical pad.
+                persist = queued_bytes(out) if cfg.strategy == "selective" else 0
+                if should_save(cfg.strategy, cfg.lam, acc, persist, cfg.bw, cfg.s0):
+                    out_q.put(("ckpt", wid, desc.task_id, stage, out, dt, cost))
                     acc = 0.0
                 else:
-                    out_q.put(("progress", wid, desc.task_id, stage, dt, cost, nbytes))
+                    out_q.put(("progress", wid, desc.task_id, stage, dt, cost))
                 ack = in_q.get()
                 if ack[0] == "shutdown":
                     out_q.put(("bye", wid))
@@ -257,6 +268,8 @@ def run_job(combo: Combo, cfg: MpCfg, kill: Optional[KillSpec] = None) -> dict:
                 "saved_stages": desc.saved_stages,
             })
             in_qs[wid].put(("assign", desc, data))
+            if desc.input_ref.startswith("ckpt:"):
+                st["recovery_load_bytes"] += queued_bytes(data)
 
     def _requeue(task_id: str):
         if task_id in done or task_id in inflight.values():
@@ -270,7 +283,6 @@ def run_job(combo: Combo, cfg: MpCfg, kill: Optional[KillSpec] = None) -> dict:
             data = ckpt_data[(task_id, k)]
             ref = f"ckpt:{task_id}:{k}"
             stage = k + 1
-            st["recovery_load_bytes"] += int(data.nbytes)
             st["from_ckpt"] += 1
         else:
             data = make_partition(idx, combo, cfg.data_seed)
@@ -320,8 +332,7 @@ def run_job(combo: Combo, cfg: MpCfg, kill: Optional[KillSpec] = None) -> dict:
             st["reexec_stages"] += 1
             st["reexec_wall"] += float(dt)
         elif kind == "ckpt":
-            nbytes = int(data.nbytes)
-            st["ckpt_bytes"] += nbytes
+            st["ckpt_bytes"] += queued_bytes(data)
             saved[task_id].append(stage)
             ckpt_data[(task_id, stage)] = data
         elif kind == "final":
