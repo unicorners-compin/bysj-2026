@@ -1,10 +1,12 @@
-"""Single-machine simulation of a K-node serial inference pipeline.
+"""In-process simulation of a K-node serial inference pipeline.
 
-Compute delays come from *measured* single-sample forward times (figs/compute_timing.csv)
-multiplied by node speed factors; link delays come from the model
+Compute delays come from measured single-sample forward times (figs/compute_timing.csv)
+multiplied by node speed factors. Link delay is computed in this process as
+
     t_tx = S*8/R + max(0, d + N(0, sigma^2))
-No packet is actually sent.  Every random draw uses numpy Generators seeded from the
-experiment seed so that all strategies face the same delay sequence.
+
+No packet is sent and no network interface is used. Every random draw uses a numpy
+Generator seeded from the experiment seed so that all strategies face the same delays.
 """
 from __future__ import annotations
 
@@ -33,6 +35,11 @@ NETWORKS: Dict[str, Link] = {
 }
 NET_CN = {"good": "良好", "medium": "一般", "poor": "较差"}
 
+# Stable regime: one bandwidth and one propagation delay for the whole run.
+STABLE_LINK = Link(40.0, 8.0, 0.0)
+# Prior used before any dynamic sample is observed (the provisioned good state).
+DYNAMIC_PRIOR = Link(80.0, 6.0, 1.5)
+
 
 @dataclass(frozen=True)
 class NodeCfg:
@@ -51,6 +58,28 @@ class Trace:
     t2: np.ndarray        # simulated compute on node 2
     nominal_link: float   # configured mean of t_link (initial estimate)
     nominal_std: float
+
+
+def dynamic_link_sequence(n: int, rng: np.random.Generator) -> List[Link]:
+    """Time-varying link: slow bandwidth wander, congestion bursts, and jitter.
+
+    Good state is 80 Mbit/s, 6 ms, jitter 1.5 ms. A burst (3.5 Mbit/s, 35 ms,
+    jitter 6 ms) starts with probability 0.02 per sample and ends with
+    probability 0.08. Bandwidth is scaled by ``1 + 0.15*sin(2π i / 500)``.
+    """
+    bad = False
+    seq: List[Link] = []
+    for i in range(n):
+        if not bad and rng.random() < 0.02:
+            bad = True
+        elif bad and rng.random() < 0.08:
+            bad = False
+        wander = 1.0 + 0.15 * np.sin(2.0 * np.pi * i / 500.0)
+        if bad:
+            seq.append(Link(float(3.5 * wander), 35.0, 6.0))
+        else:
+            seq.append(Link(float(80.0 * wander), 6.0, 1.5))
+    return seq
 
 
 def make_trace(n: int, link: Link, timing: Dict[str, float], node: NodeCfg,

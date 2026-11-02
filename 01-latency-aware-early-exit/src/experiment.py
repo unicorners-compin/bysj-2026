@@ -1,16 +1,20 @@
-"""Full experiment for the latency-aware early-exit thesis (Python teaching prototype).
+"""Stable vs dynamic link experiment for latency-aware early exit.
 
-Inputs : figs/exit_outputs_seed{s}.npz, figs/compute_timing.csv (produced by src.train
-         from a real MNIST-trained 2-exit CNN) -- only numpy/matplotlib needed here.
-Network: simulated (src.netsim); NOT a real network, NOT DPDK/hardware.
+Exit confidences and predictions come from the committed MNIST two-exit CNN
+(src.train). Stage times come from figs/compute_timing.csv. The link is not a
+network interface: bandwidth, delay and jitter are turned into a delay trace
+inside this process (src.netsim).
 
-Run from topic root:  python3 -m src.experiment
-Outputs: figs/*.csv and figs/fig*.png (see README).
+Stable regime: one bandwidth and one propagation delay, no jitter.
+Dynamic regime: slow bandwidth wander, congestion bursts, and per-sample jitter.
+
+Fixed threshold and latency-aware parameters are chosen on the validation split
+of the same regime (objective: on-time accuracy, then accuracy) and scored on
+the test split. Run from the topic directory:  python3 -m src.experiment
 """
 from __future__ import annotations
 
 import csv
-from dataclasses import replace
 from collections import defaultdict
 from pathlib import Path
 
@@ -20,410 +24,247 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from .netsim import NET_CN, NETWORKS, FEATURE_BYTES, Link, NodeCfg, make_trace
+from .netsim import DYNAMIC_PRIOR, STABLE_LINK, NodeCfg, dynamic_link_sequence, make_trace
 from .policies import Policy, run_policy
 
 ROOT = Path(__file__).resolve().parents[1]
 FIGS = ROOT / "figs"
 SEEDS = (0, 1, 2)
-BUDGET_LEVELS = {"tight": 10.0, "mid": 30.0, "loose": 80.0}   # absolute budgets in ms (application requirement)
-BUDGET_CN = {"tight": "紧", "mid": "中", "loose": "松"}
-TAU_GRID = [round(x, 3) for x in (0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.92, 0.94, 0.95, 0.96, 0.97,
-                                  0.98, 0.985, 0.99, 0.995, 0.998, 0.999)]
-ACC_TOL = 0.01          # fixed threshold: val accuracy may drop at most 1 pp vs full
-TIMEOUT_CAP = 0.05      # latency-aware: val timeout rate cap used in parameter selection
-LA_GRID = [dict(tau_min=a, tau_max=b, gamma=g, margin=m)
-           for a in (0.5, 0.6, 0.7, 0.8, 0.9)
-           for b in (0.9, 0.95, 0.98, 0.99, 0.995, 0.999)
-           for g in (0.5, 1.0, 2.0)
-           for m in (0.0, 1.0, 2.0) if a < b]
+BUDGET_MS = 20.0
 NODE = NodeCfg()
-NOTE = "Python teaching prototype: real MNIST CNN outputs + simulated network; not hardware/DPDK"
+TAU_GRID = [round(float(x), 3) for x in np.linspace(0.5, 0.995, 16)]
+LA_GRID = [
+    dict(tau_min=tmin, tau_max=tmax, gamma=g, margin=m, ewma=a, probe_every=1)
+    for tmin in (0.5, 0.7, 0.85)
+    for tmax in (0.9, 0.97, 0.995)
+    for g in (1.0, 2.0)
+    for m in (0.0, 1.0)
+    for a in (0.4, 0.8)
+    if tmin < tmax
+]
+FOOT = "教学原型：MNIST 两出口 CNN 的出口输出 + Python 进程内链路仿真"
 
 
 def setup_font():
     from matplotlib import font_manager
-    p = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
-    if Path(p).exists():
-        font_manager.fontManager.addfont(p)
-        plt.rcParams["font.family"] = font_manager.FontProperties(fname=p).get_name()
+    for path in (
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+    ):
+        if Path(path).exists():
+            font_manager.fontManager.addfont(path)
+            plt.rcParams["font.family"] = font_manager.FontProperties(fname=path).get_name()
+            break
     plt.rcParams["axes.unicode_minus"] = False
 
 
-def load_seed(s):
-    z = np.load(FIGS / f"exit_outputs_seed{s}.npz")
-    split = lambda pre: {k[len(pre):]: z[k] for k in z.files if k.startswith(pre)}
+def load_seed(seed: int):
+    z = np.load(FIGS / f"exit_outputs_seed{seed}.npz")
+
+    def split(pre):
+        return {k[len(pre):]: z[k] for k in z.files if k.startswith(pre)}
+
     return split("val_"), split("test_")
 
 
 def load_timing():
-    t = defaultdict(dict)
-    with open(FIGS / "compute_timing.csv") as f:
-        for r in csv.DictReader(f):
-            t[int(r["seed"])][r["part"]] = float(r["median_ms"])
-    return t
+    timing = defaultdict(dict)
+    with open(FIGS / "compute_timing.csv", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            timing[int(row["seed"])][row["part"]] = float(row["median_ms"])
+    return timing
 
 
 def write_csv(name, rows):
-    rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows]
+    rows = [{k: v for k, v in r.items() if not str(k).startswith("_")} for r in rows]
     with open(FIGS / name, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        w.writeheader()
-        w.writerows(rows)
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
 
 
-def rnd(r, nd=5):
-    return {k: (round(v, nd) if isinstance(v, float) else v) for k, v in r.items()}
+def _public(metrics):
+    out = {}
+    for key, value in metrics.items():
+        if key.startswith("_"):
+            continue
+        out[key] = round(float(value), 5) if isinstance(value, float) else value
+    out["deadline_hit_rate"] = round(1.0 - metrics["timeout_rate"], 5)
+    return out
 
 
-def trace_for(seed, net, n, split, timing, k=2):
-    # independent stream per (seed, net, split, K) so that every policy sees the same delays
-    code = {"good": 1, "medium": 2, "poor": 3}[net] * 10 + (1 if split == "val" else 2) + 100 * k
-    rng = np.random.default_rng(seed * 1000 + code)
-    return make_trace(n, NETWORKS[net], timing[seed], NODE, rng, k_nodes=k)
+def trace_for(regime: str, n: int, timing: dict, rng: np.random.Generator):
+    if regime == "stable":
+        return make_trace(n, STABLE_LINK, timing, NODE, rng)
+    seq = dynamic_link_sequence(n, rng)
+    return make_trace(n, DYNAMIC_PRIOR, timing, NODE, rng, link_seq=seq)
 
 
-def ev(policy, d, tr, budget):
-    return run_policy(policy, d["conf1"], d["pred1"], d["pred2"], d["label"], tr, budget, NODE)
+def _better(metrics, best):
+    key = (round(metrics["ontime_accuracy"], 5), round(metrics["accuracy"], 5), -metrics["timeout_rate"])
+    return best is None or key > best[0]
 
 
-def select_fixed(val, trv):
-    full = ev(Policy("full", "full"), val, trv, 1e9)
-    ok = [t for t in TAU_GRID
-          if ev(Policy("fixed", "fixed", tau=t, feasibility=False), val, trv, 1e9)["accuracy"] >= full["accuracy"] - ACC_TOL]
-    return min(ok) if ok else TAU_GRID[-1]
+def select_fixed(data, tr):
+    best = None
+    for tau in TAU_GRID:
+        policy = Policy("fixed", "fixed", tau=tau, feasibility=False)
+        metrics = run_policy(policy, data["conf1"], data["pred1"], data["pred2"], data["label"], tr, BUDGET_MS, NODE)
+        if _better(metrics, best):
+            best = ((round(metrics["ontime_accuracy"], 5), round(metrics["accuracy"], 5), -metrics["timeout_rate"]), tau)
+    return best[1]
 
 
-def la_policy(prm, name="latency_aware"):
-    return Policy(name, "dynamic", **prm)
-
-
-def select_la(val, trv, budget):
-    scored = []
+def select_la(data, tr):
+    best = None
     for prm in LA_GRID:
-        r = ev(la_policy(prm), val, trv, budget)
-        scored.append((prm, r))
-    feas = [x for x in scored if x[1]["timeout_rate"] <= TIMEOUT_CAP]
-    if feas:
-        best = max(feas, key=lambda x: (round(x[1]["accuracy"], 4), -x[1]["mean_latency_ms"]))
-    else:
-        best = min(scored, key=lambda x: (x[1]["timeout_rate"], -x[1]["accuracy"]))
-    return best[0], scored
+        policy = Policy("latency_aware", "dynamic", **prm)
+        metrics = run_policy(policy, data["conf1"], data["pred1"], data["pred2"], data["label"], tr, BUDGET_MS, NODE)
+        if _better(metrics, best):
+            best = ((round(metrics["ontime_accuracy"], 5), round(metrics["accuracy"], 5), -metrics["timeout_rate"]), prm)
+    return best[1]
+
+
+def score(policy, data, tr):
+    metrics = run_policy(policy, data["conf1"], data["pred1"], data["pred2"], data["label"], tr, BUDGET_MS, NODE)
+    return metrics
+
+
+def evaluate_seed(seed: int, timing: dict | None = None):
+    """Tune on validation and score on test for both regimes. Returns row dicts and the dynamic test series."""
+    if timing is None:
+        timing = load_timing()[seed]
+    val, test = load_seed(seed)
+    rows = []
+    series = None
+    chosen = {}
+    for regime, val_stream, test_stream in (
+        ("stable", 10 + seed, 110 + seed),
+        ("dynamic", 20 + seed, 210 + seed),
+    ):
+        tr_val = trace_for(regime, len(val["label"]), timing, np.random.default_rng(val_stream))
+        tr_test = trace_for(regime, len(test["label"]), timing, np.random.default_rng(test_stream))
+        tau = select_fixed(val, tr_val)
+        prm = select_la(val, tr_val)
+        chosen[regime] = {"tau_fixed": tau, **prm}
+        policies = [
+            Policy("full", "full"),
+            Policy("fixed", "fixed", tau=tau, feasibility=False),
+            Policy("latency_aware", "dynamic", **prm),
+        ]
+        for policy in policies:
+            metrics = score(policy, test, tr_test)
+            rows.append({
+                "seed": seed,
+                "regime": regime,
+                "budget_ms": BUDGET_MS,
+                "policy": policy.name,
+                "tau_fixed": tau if policy.name == "fixed" else "",
+                **_public(metrics),
+            })
+            if regime == "dynamic" and seed == 0:
+                if series is None:
+                    series = {
+                        "burst": np.array([link.bw_mbps < 20.0 for link in dynamic_link_sequence(len(test["label"]), np.random.default_rng(test_stream))], dtype=float),
+                        "budget_ms": BUDGET_MS,
+                    }
+                series[policy.name] = (metrics["_lat"] > BUDGET_MS).astype(float)
+    return rows, chosen, series
+
+
+def summarize(rows):
+    metrics = ["accuracy", "ontime_accuracy", "deadline_hit_rate", "timeout_rate", "mean_latency_ms", "exit1_ratio"]
+    groups = defaultdict(list)
+    for row in rows:
+        groups[(row["regime"], row["policy"])].append(row)
+    out = []
+    for (regime, policy), items in groups.items():
+        rec = {"regime": regime, "policy": policy, "budget_ms": BUDGET_MS, "n_seeds": len(items)}
+        for metric in metrics:
+            values = np.array([item[metric] for item in items], dtype=float)
+            rec[metric + "_mean"] = round(float(values.mean()), 5)
+            rec[metric + "_std"] = round(float(values.std(ddof=1)) if len(values) > 1 else 0.0, 5)
+        out.append(rec)
+    return out
+
+
+def _save(fig, name):
+    fig.text(0.5, -0.26, FOOT, ha="center", va="top", fontsize=7, color="#6b7280")
+    fig.tight_layout()
+    fig.savefig(FIGS / name, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def make_figs(summary, series):
+    order = ("full", "fixed", "latency_aware")
+    names = {"full": "完整推理", "fixed": "固定阈值", "latency_aware": "时延感知"}
+    colors = {"full": "#6b7280", "fixed": "#2563eb", "latency_aware": "#dc2626"}
+    regimes = ("stable", "dynamic")
+    regime_cn = {"stable": "稳定网络", "dynamic": "波动网络"}
+    lookup = {(r["regime"], r["policy"]): r for r in summary}
+
+    fig, axes = plt.subplots(1, 2, figsize=(10.2, 4.2))
+    x = np.arange(len(regimes))
+    for ax, metric, title, ylab in (
+        (axes[0], "ontime_accuracy", "按时正确率", "按时正确率 (%)"),
+        (axes[1], "deadline_hit_rate", "截止时间命中率", "命中率 (%)"),
+    ):
+        for j, policy in enumerate(order):
+            means = [lookup[(regime, policy)][metric + "_mean"] * 100 for regime in regimes]
+            stds = [lookup[(regime, policy)][metric + "_std"] * 100 for regime in regimes]
+            ax.bar(x + (j - 1) * 0.25, means, 0.25, yerr=stds, capsize=3, color=colors[policy], label=names[policy])
+        ax.set_xticks(x)
+        ax.set_xticklabels([regime_cn[r] for r in regimes])
+        ax.set_ylabel(ylab)
+        ax.set_title(title)
+        ax.set_ylim(0, 108)
+        ax.grid(axis="y", alpha=0.3)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=3, bbox_to_anchor=(0.5, -0.14), frameon=False, fontsize=8)
+    fig.suptitle(f"预算 {BUDGET_MS:.0f} ms，验证集选参后在测试集上的 3 个种子均值")
+    _save(fig, "fig_stable_vs_dynamic.png")
+
+    fig, ax = plt.subplots(figsize=(11, 3.8))
+    burst = series["burst"]
+    ax.fill_between(np.arange(len(burst)), 0, burst * 100, step="mid", color="#fee2e2", label="拥塞突发")
+    window = 200
+    kernel = np.ones(window) / window
+    for policy, color in (("fixed", colors["fixed"]), ("latency_aware", colors["latency_aware"])):
+        rolled = np.convolve(series[policy], kernel, mode="same") * 100
+        ax.plot(rolled, color=color, lw=1.2, label=names[policy])
+    ax.set_xlabel("测试样本序号")
+    ax.set_ylabel("滑动超时率 (%)，窗口 200")
+    ax.set_title("波动网络下的滑动超时率（种子 0）")
+    ax.legend(fontsize=8, ncol=3)
+    ax.grid(alpha=0.3)
+    _save(fig, "fig_dynamic_timeout_trace.png")
 
 
 def main():
     setup_font()
+    FIGS.mkdir(exist_ok=True)
     timing = load_timing()
-    data = {s: load_seed(s) for s in SEEDS}
-    per_seed, params_rows, model_rows = [], [], []
-    shared_pool = defaultdict(list)   # combo index -> list of val ontime-acc over configs
-    selected = {}
-    for s in SEEDS:
-        val, test = data[s]
-        model_rows.append({"seed": s,
-                           "val_acc_exit1": float((val["pred1"] == val["label"]).mean()),
-                           "val_acc_exit2": float((val["pred2"] == val["label"]).mean()),
-                           "test_acc_exit1": float((test["pred1"] == test["label"]).mean()),
-                           "test_acc_exit2": float((test["pred2"] == test["label"]).mean()),
-                           "t_stage1_ms": timing[s]["stage1"], "t_exit1_ms": timing[s]["exit1_head"],
-                           "t_stage2_ms": timing[s]["stage2_with_final_exit"]})
-        for net in NETWORKS:
-            trv = trace_for(s, net, len(val["label"]), "val", timing)
-            trt = trace_for(s, net, len(test["label"]), "test", timing)
-            base = ev(Policy("full", "full"), val, trv, 1e9)["mean_latency_ms"]
-            tau_fix = select_fixed(val, trv)
-            for bl, B in BUDGET_LEVELS.items():
-                prm, scored = select_la(val, trv, B)
-                for i, (_, r) in enumerate(scored):
-                    shared_pool[i].append(r["ontime_accuracy"])
-                selected[(s, net, bl)] = (B, tau_fix, prm, trt)
-                params_rows.append({"seed": s, "network": net, "budget_level": bl, "budget_ms": round(B, 4),
-                                    "base_full_val_ms": round(base, 4), "tau_fixed": tau_fix, **prm})
-    shared_idx = max(shared_pool, key=lambda i: np.mean(shared_pool[i]))
-    shared = LA_GRID[shared_idx]
-    print("shared LA params:", shared)
-
-    for (s, net, bl), (B, tau_fix, prm, trt) in selected.items():
-        test = data[s][1]
-        pols = [
-            Policy("full", "full"),
-            Policy("fixed", "fixed", tau=tau_fix, feasibility=False),
-            Policy("conf_only", "fixed", tau=prm["tau_max"], feasibility=False),
-            Policy("feas_only", "fixed", tau=tau_fix, feasibility=True, dynamic=False, margin=prm["margin"]),
-            la_policy(prm, "latency_aware"),
-            la_policy(shared, "latency_aware_shared"),
-        ]
-        for p in pols:
-            r = ev(p, test, trt, B)
-            per_seed.append(rnd({"seed": s, "network": net, "budget_level": bl, "budget_ms": B,
-                                 "policy": p.name, **r}))
-    write_csv("main_results_per_seed.csv", per_seed)
-    write_csv("params_selected.csv", params_rows + [{"seed": "shared", "network": "all", "budget_level": "all",
-                                                     "budget_ms": "", "base_full_val_ms": "", "tau_fixed": "", **shared}])
-    write_csv("model_accuracy.csv", [rnd(r) for r in model_rows])
-
-    # summary mean/std over seeds
-    metrics = ["accuracy", "ontime_accuracy", "mean_latency_ms", "p95_latency_ms", "timeout_rate", "mean_tx_bytes", "exit1_ratio"]
-    groups = defaultdict(list)
-    for r in per_seed:
-        groups[(r["network"], r["budget_level"], r["policy"])].append(r)
-    summary = []
-    for (net, bl, pol), rs in groups.items():
-        row = {"network": net, "budget_level": bl, "policy": pol, "budget_ms": round(np.mean([x["budget_ms"] for x in rs]), 3)}
-        for m in metrics:
-            v = np.array([x[m] for x in rs])
-            row[m + "_mean"] = round(float(v.mean()), 5)
-            row[m + "_std"] = round(float(v.std(ddof=1)), 5)
-        summary.append(row)
-    write_csv("main_results_summary.csv", summary)
-    S = {(r["network"], r["budget_level"], r["policy"]): r for r in summary}
-
-    # ---- budget sweep (shared LA params, fixed tau per seed) -----------------------
-    factors = [4, 6, 8, 10, 12, 15, 20, 25, 30, 35, 40, 50, 60, 70, 80, 100]  # absolute budgets (ms)
-    sweep = []
-    for s in SEEDS:
-        val, test = data[s]
-        for net in NETWORKS:
-            trv = trace_for(s, net, len(val["label"]), "val", timing)
-            trt = trace_for(s, net, len(test["label"]), "test", timing)
-            base = ev(Policy("full", "full"), val, trv, 1e9)["mean_latency_ms"]
-            tau_fix = selected[(s, net, "mid")][1]
-            for f in factors:
-                for p in (Policy("full", "full"), Policy("fixed", "fixed", tau=tau_fix, feasibility=False),
-                          la_policy(shared, "latency_aware_shared")):
-                    r = ev(p, test, trt, float(f))
-                    sweep.append(rnd({"seed": s, "network": net, "budget_ms": f, "policy": p.name, **r}))
-    write_csv("budget_sweep.csv", sweep)
-
-    # ---- trade-off curves at mid budget --------------------------------------------
-    trade = []
-    for s in SEEDS:
-        val, test = data[s]
-        for net in NETWORKS:
-            B, tau_fix, prm, trt = selected[(s, net, "mid")]
-            for t in TAU_GRID:
-                r = ev(Policy("fixed", "fixed", tau=t, feasibility=False), test, trt, B)
-                trade.append(rnd({"seed": s, "network": net, "policy": "fixed", "param": t, **r}))
-            for tm in (0.9, 0.95, 0.98, 0.99, 0.995, 0.999):
-                for tmin in (0.5, 0.7, 0.9):
-                    if tmin >= tm:
-                        continue
-                    pp = dict(prm, tau_max=tm, tau_min=tmin)
-                    r = ev(la_policy(pp), test, trt, B)
-                    trade.append(rnd({"seed": s, "network": net, "policy": "latency_aware",
-                                      "param": f"{tmin}/{tm}", **r}))
-            r = ev(Policy("full", "full"), test, trt, B)
-            trade.append(rnd({"seed": s, "network": net, "policy": "full", "param": "", **r}))
-    write_csv("tradeoff_mid_budget.csv", trade)
-
-    # ---- K=3 (relay) at medium network, all budgets -------------------------------
-    k3 = []
-    for s in SEEDS:
-        val, test = data[s]
-        trv3 = trace_for(s, "medium", len(val["label"]), "val", timing, k=3)
-        trt3 = trace_for(s, "medium", len(test["label"]), "test", timing, k=3)
-        base3 = ev(Policy("full", "full"), val, trv3, 1e9)["mean_latency_ms"]
-        tau_fix = selected[(s, "medium", "mid")][1]
-        for bl, B in BUDGET_LEVELS.items():
-            prm, _ = select_la(val, trv3, B)
-            for p in (Policy("full", "full"), Policy("fixed", "fixed", tau=tau_fix, feasibility=False), la_policy(prm)):
-                r = ev(p, test, trt3, B)
-                k3.append(rnd({"seed": s, "K": 3, "network": "medium", "budget_level": bl, "budget_ms": B, "policy": p.name, **r}))
-    write_csv("k3_relay_results.csv", k3)
-
-    # ---- time-varying network (Gilbert-Elliott between medium and poor) ------------
-    dyn = []
-    dyn_series = {}
-    for s in SEEDS:
-        val, test = data[s]
-        n = len(test["label"])
-        rng = np.random.default_rng(9000 + s)
-        state, states = 0, []
-        for _ in range(n):
-            if rng.random() < 0.004:
-                state = 1 - state
-            states.append(state)
-        seq = [NETWORKS["medium"] if st == 0 else NETWORKS["poor"] for st in states]
-        tr = make_trace(n, NETWORKS["medium"], timing[s], NODE, rng, link_seq=seq)
-        trv = trace_for(s, "medium", len(val["label"]), "val", timing)
-        base = ev(Policy("full", "full"), val, trv, 1e9)["mean_latency_ms"]
-        B = BUDGET_LEVELS["mid"]
-        prm = selected[(s, "medium", "mid")][2]
-        tau_fix = selected[(s, "medium", "mid")][1]
-        variants = [Policy("fixed", "fixed", tau=tau_fix, feasibility=False),
-                    replace(la_policy(prm), name="la_static_estimate", ewma=0.0),
-                    la_policy(prm, "la_ewma"),
-                    replace(la_policy(prm), name="la_ewma_probe", probe_every=20)]
-        for p in variants:
-            r = ev(p, test, tr, B)
-            dyn.append(rnd({"seed": s, "budget_ms": B, "bad_state_fraction": float(np.mean(states)), "policy": p.name, **r}))
-            if s == 0:
-                dyn_series[p.name] = (r["_lat"] > B).astype(float)
-        if s == 0:
-            dyn_series["_states"] = np.array(states)
-            dyn_series["_B"] = B
-    write_csv("dynamic_network_results.csv", dyn)
-
-    # ---- calibration / confidence of exit 1 (test, all seeds) ----------------------
-    cal = []
-    bins = np.linspace(0, 1, 11)
-    for s in SEEDS:
-        test = data[s][1]
-        c, ok = test["conf1"], test["pred1"] == test["label"]
-        ece = 0.0
-        for lo, hi in zip(bins[:-1], bins[1:]):
-            m = (c > lo) & (c <= hi)
-            if m.sum():
-                ece += m.mean() * abs(ok[m].mean() - c[m].mean())
-                cal.append({"seed": s, "bin_lo": round(lo, 1), "bin_hi": round(hi, 1), "count": int(m.sum()),
-                            "mean_conf": round(float(c[m].mean()), 5), "accuracy": round(float(ok[m].mean()), 5)})
-        cal.append({"seed": s, "bin_lo": "ECE", "bin_hi": "", "count": len(c), "mean_conf": round(float(ece), 5), "accuracy": ""})
-    write_csv("exit1_calibration.csv", cal)
-
-    # ---- confidence measure comparison (max-prob vs margin vs entropy), no network ---
-    cm = []
-    for s in SEEDS:
-        test = data[s][1]
-        ok1 = test["pred1"] == test["label"]; ok2 = test["pred2"] == test["label"]
-        for meas, score in (("max_prob", test["conf1"]), ("margin", test["margin1"]), ("neg_entropy", -test["entropy1"])):
-            for q in (0.3, 0.4, 0.5, 0.6, 0.7):
-                thr = np.quantile(score, 1 - q)
-                ex = score >= thr
-                cm.append(rnd({"seed": s, "measure": meas, "target_exit_ratio": q, "exit1_ratio": float(ex.mean()),
-                               "accuracy": float(np.where(ex, ok1, ok2).mean()),
-                               "exit1_subset_accuracy": float(ok1[ex].mean())}))
-    write_csv("confidence_measure_comparison.csv", cm)
-
-    make_figs(S, sweep, trade, per_seed, dyn_series, cal, model_rows)
-    print("done;", NOTE)
-
-
-POL_CN = {"full": "完整推理", "fixed": "固定阈值", "conf_only": "仅考虑置信度", "feas_only": "仅预算可行性",
-          "latency_aware": "时延感知(逐条件调参)", "latency_aware_shared": "时延感知(共用参数)"}
-COL = {"full": "#6b7280", "fixed": "#2563eb", "conf_only": "#a855f7", "feas_only": "#f59e0b",
-       "latency_aware": "#dc2626", "latency_aware_shared": "#16a34a"}
-FOOT = "教学原型：MNIST 实训 CNN 出口输出 + 单机网络仿真，非硬件/DPDK 实测"
-
-
-def _save(fig, name):
-    fig.text(0.99, 0.005, FOOT, ha="right", va="bottom", fontsize=7, color="#6b7280")
-    fig.tight_layout(rect=(0, 0.02, 1, 1))
-    fig.savefig(FIGS / name, dpi=150)
-    plt.close(fig)
-
-
-def make_figs(S, sweep, trade, per_seed, dyn_series, cal, model_rows):
-    # fig1 training curves
-    log = list(csv.DictReader(open(FIGS / "train_log.csv")))
-    fig, ax = plt.subplots(figsize=(7, 4.2))
-    for key, lab, c in (("val_acc_exit1", "中间出口", "#f59e0b"), ("val_acc_exit2", "最终出口", "#2563eb")):
-        eps = sorted({int(r["epoch"]) for r in log})
-        arr = np.array([[float(r[key]) for r in log if int(r["epoch"]) == e] for e in eps])
-        ax.errorbar(eps, arr.mean(1) * 100, yerr=arr.std(1, ddof=1) * 100, marker="o", capsize=3, label=lab, color=c)
-    ax.set_xlabel("训练轮次 (epoch)"); ax.set_ylabel("验证集准确率 (%)"); ax.grid(alpha=.3); ax.legend()
-    ax.set_title("两出口 CNN 在 MNIST 验证集上的训练曲线（3 个种子均值±标准差）")
-    _save(fig, "fig1_training_curves.png")
-
-    # fig2 exit1 confidence histogram + reliability
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(10, 4))
-    data0 = load_seed(0)[1]
-    ok = data0["pred1"] == data0["label"]
-    a1.hist(data0["conf1"][ok], bins=40, alpha=.7, label="中间出口预测正确", color="#16a34a")
-    a1.hist(data0["conf1"][~ok], bins=40, alpha=.7, label="中间出口预测错误", color="#dc2626")
-    a1.set_xlabel("中间出口最大类别概率 c1"); a1.set_ylabel("样本数"); a1.legend(); a1.set_title("测试集置信度分布（种子0）")
-    rows = [r for r in cal if r["bin_lo"] != "ECE"]
-    for s, mk in zip(SEEDS, "osd"):
-        rr = [r for r in rows if r["seed"] == s]
-        a2.plot([r["mean_conf"] for r in rr], [r["accuracy"] for r in rr], marker=mk, label=f"种子{s}")
-    a2.plot([0, 1], [0, 1], "k--", lw=1, label="理想校准")
-    eces = [r["mean_conf"] for r in cal if r["bin_lo"] == "ECE"]
-    a2.set_title(f"中间出口可靠性图（ECE 均值 {np.mean(eces):.3f}）")
-    a2.set_xlabel("分箱平均置信度"); a2.set_ylabel("分箱准确率"); a2.legend(); a2.grid(alpha=.3)
-    _save(fig, "fig2_exit1_confidence.png")
-
-    # fig3 trade-off
-    fig, axs = plt.subplots(1, 3, figsize=(13, 4.2))
-    for ax, net in zip(axs, NETWORKS):
-        for pol, mk in (("fixed", "o-"), ("latency_aware", "s")):
-            rr = [r for r in trade if r["network"] == net and r["policy"] == pol]
-            params = sorted({r["param"] for r in rr}, key=str)
-            xs = [np.mean([r["mean_latency_ms"] for r in rr if r["param"] == p]) for p in params]
-            ys = [np.mean([r["ontime_accuracy"] for r in rr if r["param"] == p]) * 100 for p in params]
-            if pol == "fixed":
-                ax.plot(xs, ys, mk, color=COL[pol], ms=4, label="固定阈值 τ 扫描")
-            else:
-                ax.scatter(xs, ys, marker="s", color=COL[pol], s=22, label="时延感知 (τ_min, τ_max) 扫描", zorder=3)
-        rr = [r for r in trade if r["network"] == net and r["policy"] == "full"]
-        ax.scatter([np.mean([r["mean_latency_ms"] for r in rr])], [np.mean([r["ontime_accuracy"] for r in rr]) * 100],
-                   marker="*", s=160, color=COL["full"], label="完整推理", zorder=4)
-        ax.set_title(f"{NET_CN[net]}网络，中预算"); ax.set_xlabel("平均仿真时延 (ms)"); ax.set_ylabel("按时正确率 (%)")
-        ax.grid(alpha=.3)
-    axs[0].legend(fontsize=8)
-    _save(fig, "fig3_tradeoff_mid_budget.png")
-
-    # fig4 timeout vs budget factor
-    fig, axs = plt.subplots(1, 3, figsize=(13, 4.0), sharey=True)
-    for ax, net in zip(axs, NETWORKS):
-        for pol in ("full", "fixed", "latency_aware_shared"):
-            rr = [r for r in sweep if r["network"] == net and r["policy"] == pol]
-            fs = sorted({r["budget_ms"] for r in rr})
-            m = [np.mean([r["timeout_rate"] for r in rr if r["budget_ms"] == f]) * 100 for f in fs]
-            ax.plot(fs, m, marker=".", color=COL[pol], label=POL_CN[pol])
-        for f in BUDGET_LEVELS.values():
-            ax.axvline(f, color="#d1d5db", ls=":")
-        ax.set_title(f"{NET_CN[net]}网络"); ax.set_xlabel("时延预算 B (ms，对数坐标)"); ax.set_xscale("log"); ax.grid(alpha=.3)
-    axs[0].set_ylabel("超时率 (%)"); axs[0].legend(fontsize=8)
-    _save(fig, "fig4_timeout_vs_budget.png")
-
-    # fig5 exit stage distribution
-    fig, ax = plt.subplots(figsize=(11, 4.2))
-    labels, x = [], 0
-    for net in NETWORKS:
-        for bl in BUDGET_LEVELS:
-            for j, pol in enumerate(("fixed", "latency_aware")):
-                r = S[(net, bl, pol)]
-                e1 = r["exit1_ratio_mean"] * 100
-                ax.bar(x + j * 0.38, e1, 0.36, color="#f59e0b" if j == 0 else "#fb7185")
-                ax.bar(x + j * 0.38, 100 - e1, 0.36, bottom=e1, color="#93c5fd" if j == 0 else "#60a5fa")
-            labels.append((x + 0.19, f"{NET_CN[net]}/{BUDGET_CN[bl]}"))
-            x += 1
-    ax.set_xticks([l[0] for l in labels]); ax.set_xticklabels([l[1] for l in labels])
-    from matplotlib.patches import Patch
-    ax.legend(handles=[Patch(color="#f59e0b", label="固定阈值：中间出口退出"), Patch(color="#93c5fd", label="固定阈值：最终出口"),
-                       Patch(color="#fb7185", label="时延感知：中间出口退出"), Patch(color="#60a5fa", label="时延感知：最终出口")],
-              fontsize=8, ncol=2, loc="upper right")
-    ax.set_ylabel("样本比例 (%)"); ax.set_ylim(0, 125); ax.set_title("退出位置分布（左柱固定阈值，右柱时延感知；网络/预算档）")
-    _save(fig, "fig5_exit_stage_distribution.png")
-
-    # fig6 ablation
-    fig, axs = plt.subplots(1, 2, figsize=(11, 4.2))
-    pols = ("fixed", "conf_only", "feas_only", "latency_aware")
-    cfgs = (("medium", "mid"), ("poor", "tight"), ("good", "loose"))
-    w = 0.2
-    for ax, met, lab in ((axs[0], "timeout_rate", "超时率 (%)"), (axs[1], "accuracy", "准确率 (%)")):
-        for j, pol in enumerate(pols):
-            v = [S[(n, b, pol)][met + "_mean"] * 100 for n, b in cfgs]
-            e = [S[(n, b, pol)][met + "_std"] * 100 for n, b in cfgs]
-            ax.bar(np.arange(3) + (j - 1.5) * w, v, w, yerr=e, capsize=2, color=COL[pol], label=POL_CN[pol])
-        ax.set_xticks(range(3)); ax.set_xticklabels([f"{NET_CN[n]}网络/{BUDGET_CN[b]}预算" for n, b in cfgs])
-        ax.set_ylabel(lab); ax.grid(axis="y", alpha=.3)
-    axs[1].set_ylim(80, 100)
-    axs[0].legend(fontsize=8)
-    axs[0].set_title("消融：超时率"); axs[1].set_title("消融：整体准确率")
-    _save(fig, "fig6_ablation.png")
-
-    # fig7 dynamic network timeout (rolling)
-    fig, ax = plt.subplots(figsize=(11, 3.8))
-    st = dyn_series["_states"]
-    ax.fill_between(np.arange(len(st)), 0, st * 100, color="#fee2e2", step="mid", label="较差状态区间")
-    k = 200
-    for name, lab, c in (("fixed", "固定阈值", COL["fixed"]), ("la_static_estimate", "时延感知-静态估计", "#a855f7"),
-                         ("la_ewma", "时延感知-EWMA", COL["latency_aware"]), ("la_ewma_probe", "时延感知-EWMA+探测", COL["latency_aware_shared"])):
-        y = np.convolve(dyn_series[name], np.ones(k) / k, mode="same") * 100
-        ax.plot(y, color=c, lw=1.2, label=lab)
-    ax.set_xlabel("测试样本序号（按到达顺序）"); ax.set_ylabel("滑动超时率 (%)，窗口200")
-    ax.set_title("时变网络（一般/较差两状态切换）下的滑动超时率，种子0"); ax.legend(fontsize=8, ncol=3); ax.grid(alpha=.3)
-    _save(fig, "fig7_dynamic_network.png")
+    rows, params = [], []
+    series = None
+    for seed in SEEDS:
+        seed_rows, chosen, seed_series = evaluate_seed(seed, timing[seed])
+        rows.extend(seed_rows)
+        for regime, prm in chosen.items():
+            params.append({"seed": seed, "regime": regime, "budget_ms": BUDGET_MS, **prm})
+        if seed_series is not None:
+            series = seed_series
+    summary = summarize(rows)
+    write_csv("stable_vs_dynamic_per_seed.csv", rows)
+    write_csv("stable_vs_dynamic_summary.csv", summary)
+    write_csv("params_selected.csv", params)
+    make_figs(summary, series)
+    for row in summary:
+        print(
+            f"{row['regime']:8} {row['policy']:16} "
+            f"ontime={row['ontime_accuracy_mean']:.4f} hit={row['deadline_hit_rate_mean']:.4f} "
+            f"acc={row['accuracy_mean']:.4f}"
+        )
 
 
 if __name__ == "__main__":
