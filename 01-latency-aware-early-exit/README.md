@@ -1,25 +1,47 @@
 # 01 时延感知早退（分布式推理，Python 教学原型）
 
-学生：待定
+学生：李炫（2023级通信工程，学号 23009100101）
 
 指导教师：任智源（西安电子科技大学通信工程学院）
 
-**真实部分**：在 MNIST 上用 PyTorch 实际训练带 1 个中间出口 + 1 个最终出口的小型 CNN（3 个种子，10 轮），
-导出每个验证/测试样本两个出口的置信度与预测（`figs/exit_outputs_seed*.npz`），并实测单样本各阶段前向耗时。
-**仿真部分**：2/3 个逻辑节点之间的链路（带宽 + 固定时延 + 截断正态抖动）由 `src/netsim.py` 计算，不发送真实数据包。
-> 非 DPDK、非硬件实测；所有时延为「实测计算时延 × 节点速度系数 + 仿真链路时延」。
+出口置信度和预测来自在 MNIST 上训练的两出口 CNN（`src/train.py`，需要 PyTorch；`figs/exit_outputs_seed*.npz` 与 `figs/compute_timing.csv` 已提交，实验不必重新训练）。链路不经过网卡：带宽、传播时延和抖动在 `src/netsim.py` 里换成时延，不发送数据包。
+
+两种网络，预算都是 20 ms：
+
+- **稳定网络**：带宽 40 Mbit/s、传播时延 8 ms、抖动为 0。继续推理的时延约 10 ms，截止时间不是约束。
+- **波动网络**：常态约 80 Mbit/s、6 ms，叠加缓慢的带宽起伏；以一定概率进入拥塞突发（约 3.5 Mbit/s、35 ms、抖动 6 ms）。突发期间继续推理会超过 20 ms。
+
+固定阈值和时延感知的参数都在**同一体制的验证集**上按按时正确率选取，再在测试集上计分。时延感知用 EWMA 跟踪最近一次链路时延（提前退出时用一次探测更新估计），阈值随剩余时间变化。固定阈值在整个测试过程中不变。
 
 ```bash
-python3 -m src.mnist_data      # 下载 MNIST 到 data/（git 忽略）
-python3 -m src.train           # 需要 torch；训练 3 个种子并导出出口输出（已提交结果，可跳过）
-python3 -m src.experiment      # 只需 numpy/matplotlib：参数选择(验证集) + 测试集全部实验 + 出图
+python3 -m src.train        # 可选；需要 torch。已提交出口输出和阶段耗时，可跳过
+python3 -m src.experiment   # numpy / matplotlib：稳定 vs 波动
 python3 -m pytest -q
 ```
 
+## 测试集结果（3 个种子均值）
+
+按时正确率 = 预测正确且未超过预算的样本比例。截止命中率 = 1 − 超时率。
+
+| 网络 | 策略 | 准确率 | 按时正确率 | 截止命中率 |
+|------|------|--------|------------|------------|
+| 稳定 | 完整推理 | 0.9894 | 0.9894 | 1.0000 |
+| 稳定 | 固定阈值 | 0.9894 | 0.9894 | 1.0000 |
+| 稳定 | 时延感知 | 0.9884 | 0.9884 | 1.0000 |
+| 波动 | 完整推理 | 0.9894 | 0.7900 | 0.7982 |
+| 波动 | 固定阈值 | 0.9696 | 0.9241 | 0.9529 |
+| 波动 | 时延感知 | 0.9690 | 0.9543 | 0.9851 |
+
+稳定网络上三者的截止命中率都是 1。固定阈值和完整推理的按时正确率同为 0.9894；时延感知是 0.9884，低 0.001，链路不变时在线调整没有优势。
+
+波动网络上完整推理的截止命中率降到 0.7982，按时正确率 0.7900。验证集上选出的固定阈值把命中率提高到 0.9529、按时正确率提高到 0.9241，做法是更多使用中间出口。时延感知的准确率与固定阈值几乎相同（0.9690 对 0.9696），但截止命中率 0.9851、按时正确率 0.9543，分别高约 0.032 和 0.030。三个种子方向一致（见 `stable_vs_dynamic_per_seed.csv`）。
+
 | 文件 | 内容 |
-|---|---|
-| `train_log.csv` / `model_accuracy.csv` / `compute_timing.csv` / `model_summary.csv` / `env.txt` | 训练曲线、各出口准确率、实测阶段耗时、参数量、环境 |
-| `params_selected.csv` | 验证集上为每个(种子,网络,预算)选出的 τ_fixed 与 τ_min/τ_max/γ/margin，及共用参数 |
-| `main_results_per_seed.csv` / `main_results_summary.csv` | 3 网络 × 3 预算(10/30/80 ms) × 6 方案，3 种子均值±标准差 |
-| `budget_sweep.csv`, `tradeoff_mid_budget.csv`, `k3_relay_results.csv`, `dynamic_network_results.csv`, `exit1_calibration.csv`, `confidence_measure_comparison.csv` | 预算扫描、权衡曲线、K=3 中继、时变网络、校准、置信度度量对比 |
-| `fig1`–`fig7` PNG | 训练曲线、置信度/可靠性图、权衡曲线、超时率-预算、退出位置分布、消融、时变网络 |
+|------|------|
+| `stable_vs_dynamic_per_seed.csv` / `stable_vs_dynamic_summary.csv` | 分种子与 3 种子均值±标准差 |
+| `params_selected.csv` | 验证集上选出的固定阈值和时延感知参数 |
+| `fig_stable_vs_dynamic.png` | 按时正确率与截止命中率 |
+| `fig_dynamic_timeout_trace.png` | 种子 0 在突发区间上的滑动超时率 |
+| `train_log.csv` / `compute_timing.csv` / `exit_outputs_seed*.npz` | 训练曲线、实测阶段耗时、出口输出 |
+
+依赖见 `requirements.txt`。`src.experiment` 只使用 numpy 和 matplotlib；`src.train` 另需 torch。

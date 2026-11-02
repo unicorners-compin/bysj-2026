@@ -1,0 +1,7 @@
+regime,policy,budget_ms,n_seeds,accuracy_mean,accuracy_std,ontime_accuracy_mean,ontime_accuracy_std,deadline_hit_rate_mean,deadline_hit_rate_std,timeout_rate_mean,timeout_rate_std,mean_latency_ms_mean,mean_latency_ms_std,exit1_ratio_mean,exit1_ratio_std
+stable,full,20.0,3,0.98937,0.00124,0.98937,0.00124,1.0,0.0,0.0,0.0,9.95863,0.15707,0.0,0.0
+stable,fixed,20.0,3,0.98937,0.00124,0.98937,0.00124,1.0,0.0,0.0,0.0,9.37013,0.14673,0.06263,0.03203
+stable,latency_aware,20.0,3,0.98837,0.00103,0.98837,0.00103,1.0,0.0,0.0,0.0,5.8432,1.11458,0.4382,0.13321
+dynamic,full,20.0,3,0.98937,0.00124,0.79,0.02009,0.79823,0.01935,0.20177,0.01935,15.98887,0.74545,0.0,0.0
+dynamic,fixed,20.0,3,0.9696,0.00429,0.92407,0.01923,0.95287,0.01631,0.04713,0.01631,4.12117,1.03001,0.77333,0.06909
+dynamic,latency_aware,20.0,3,0.969,0.00795,0.95427,0.00868,0.98507,0.00076,0.01493,0.00076,4.31104,0.45151,0.5424,0.08375
