@@ -39,6 +39,7 @@ NET_CN = {"good": "良好", "medium": "一般", "poor": "较差"}
 STABLE_LINK = Link(40.0, 8.0, 0.0)
 # Prior used before any dynamic sample is observed (the provisioned good state).
 DYNAMIC_PRIOR = Link(80.0, 6.0, 1.5)
+MODERATE_PRIOR = Link(50.0, 8.0, 1.0)
 
 
 @dataclass(frozen=True)
@@ -60,26 +61,56 @@ class Trace:
     nominal_std: float
 
 
-def dynamic_link_sequence(n: int, rng: np.random.Generator) -> List[Link]:
-    """Time-varying link: slow bandwidth wander, congestion bursts, and jitter.
+def fluctuating_link_sequence(
+    n: int,
+    rng: np.random.Generator,
+    good: Link,
+    bad: Link,
+    p_enter: float,
+    p_leave: float,
+    wander_amp: float,
+    period: float,
+) -> List[Link]:
+    """Good link, scaled by a slow sine, with random congestion bursts.
 
-    Good state is 80 Mbit/s, 6 ms, jitter 1.5 ms. A burst (3.5 Mbit/s, 35 ms,
-    jitter 6 ms) starts with probability 0.02 per sample and ends with
-    probability 0.08. Bandwidth is scaled by ``1 + 0.15*sin(2π i / 500)``.
+    Bandwidth is ``base * (1 + wander_amp * sin(2π i / period))``. Delay and
+    jitter switch with the burst state and are not scaled.
     """
-    bad = False
+    in_burst = False
     seq: List[Link] = []
     for i in range(n):
-        if not bad and rng.random() < 0.02:
-            bad = True
-        elif bad and rng.random() < 0.08:
-            bad = False
-        wander = 1.0 + 0.15 * np.sin(2.0 * np.pi * i / 500.0)
-        if bad:
-            seq.append(Link(float(3.5 * wander), 35.0, 6.0))
-        else:
-            seq.append(Link(float(80.0 * wander), 6.0, 1.5))
+        if not in_burst and rng.random() < p_enter:
+            in_burst = True
+        elif in_burst and rng.random() < p_leave:
+            in_burst = False
+        base = bad if in_burst else good
+        wander = 1.0 + wander_amp * np.sin(2.0 * np.pi * i / period)
+        seq.append(Link(float(base.bw_mbps * wander), base.delay_ms, base.jitter_ms))
     return seq
+
+
+def dynamic_link_sequence(n: int, rng: np.random.Generator) -> List[Link]:
+    """Strong fluctuation: 80 Mbit/s / 6 ms, bursts at 3.5 Mbit/s / 35 ms.
+
+    A burst starts with probability 0.02 per sample and ends with 0.08.
+    Bandwidth wander amplitude is 0.15 over a 500-sample period. Jitter is
+    1.5 ms in the good state and 6 ms in a burst.
+    """
+    return fluctuating_link_sequence(
+        n, rng, Link(80.0, 6.0, 1.5), Link(3.5, 35.0, 6.0), 0.02, 0.08, 0.15, 500.0,
+    )
+
+
+def moderate_link_sequence(n: int, rng: np.random.Generator) -> List[Link]:
+    """Mild fluctuation between the stable link and the strong-burst regime.
+
+    Good state is 50 Mbit/s, 8 ms, jitter 1 ms. Bursts are 12 Mbit/s, 16 ms,
+    jitter 3 ms, entered with probability 0.01 and left with 0.12. Wander
+    amplitude is 0.08 over 800 samples.
+    """
+    return fluctuating_link_sequence(
+        n, rng, Link(50.0, 8.0, 1.0), Link(12.0, 16.0, 3.0), 0.01, 0.12, 0.08, 800.0,
+    )
 
 
 def make_trace(n: int, link: Link, timing: Dict[str, float], node: NodeCfg,

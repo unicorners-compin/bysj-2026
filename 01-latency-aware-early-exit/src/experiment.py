@@ -1,16 +1,15 @@
-"""Stable vs dynamic link experiment for latency-aware early exit.
+"""Three link regimes × three latency budgets for latency-aware early exit.
 
 Exit confidences and predictions come from the committed MNIST two-exit CNN
 (src.train). Stage times come from figs/compute_timing.csv. The link is not a
 network interface: bandwidth, delay and jitter are turned into a delay trace
 inside this process (src.netsim).
 
-Stable regime: one bandwidth and one propagation delay, no jitter.
-Dynamic regime: slow bandwidth wander, congestion bursts, and per-sample jitter.
-
-Fixed threshold and latency-aware parameters are chosen on the validation split
-of the same regime (objective: on-time accuracy, then accuracy) and scored on
-the test split. Run from the topic directory:  python3 -m src.experiment
+Regimes: stable (fixed bandwidth and delay), moderate fluctuation, strong
+fluctuation (wander, congestion bursts, jitter). Budgets: 12 / 20 / 80 ms.
+Fixed-threshold and latency-aware parameters are chosen on the validation split
+of the same regime and budget (objective: on-time accuracy, then accuracy) and
+scored on the test split. Run from the topic directory:  python3 -m src.experiment
 """
 from __future__ import annotations
 
@@ -24,13 +23,22 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from .netsim import DYNAMIC_PRIOR, STABLE_LINK, NodeCfg, dynamic_link_sequence, make_trace
+from .netsim import (
+    DYNAMIC_PRIOR,
+    MODERATE_PRIOR,
+    STABLE_LINK,
+    NodeCfg,
+    dynamic_link_sequence,
+    make_trace,
+    moderate_link_sequence,
+)
 from .policies import Policy, run_policy
 
 ROOT = Path(__file__).resolve().parents[1]
 FIGS = ROOT / "figs"
 SEEDS = (0, 1, 2)
-BUDGET_MS = 20.0
+BUDGETS = (("tight", 12.0), ("mid", 20.0), ("loose", 80.0))
+REGIMES = ("stable", "moderate", "dynamic")
 NODE = NodeCfg()
 TAU_GRID = [round(float(x), 3) for x in np.linspace(0.5, 0.995, 16)]
 LA_GRID = [
@@ -97,8 +105,13 @@ def _public(metrics):
 def trace_for(regime: str, n: int, timing: dict, rng: np.random.Generator):
     if regime == "stable":
         return make_trace(n, STABLE_LINK, timing, NODE, rng)
-    seq = dynamic_link_sequence(n, rng)
-    return make_trace(n, DYNAMIC_PRIOR, timing, NODE, rng, link_seq=seq)
+    if regime == "moderate":
+        seq = moderate_link_sequence(n, rng)
+        return make_trace(n, MODERATE_PRIOR, timing, NODE, rng, link_seq=seq)
+    if regime == "dynamic":
+        seq = dynamic_link_sequence(n, rng)
+        return make_trace(n, DYNAMIC_PRIOR, timing, NODE, rng, link_seq=seq)
+    raise ValueError(regime)
 
 
 def _better(metrics, best):
@@ -106,70 +119,71 @@ def _better(metrics, best):
     return best is None or key > best[0]
 
 
-def select_fixed(data, tr):
+def select_fixed(data, tr, budget):
     best = None
     for tau in TAU_GRID:
         policy = Policy("fixed", "fixed", tau=tau, feasibility=False)
-        metrics = run_policy(policy, data["conf1"], data["pred1"], data["pred2"], data["label"], tr, BUDGET_MS, NODE)
+        metrics = run_policy(policy, data["conf1"], data["pred1"], data["pred2"], data["label"], tr, budget, NODE)
         if _better(metrics, best):
             best = ((round(metrics["ontime_accuracy"], 5), round(metrics["accuracy"], 5), -metrics["timeout_rate"]), tau)
     return best[1]
 
 
-def select_la(data, tr):
+def select_la(data, tr, budget):
     best = None
     for prm in LA_GRID:
         policy = Policy("latency_aware", "dynamic", **prm)
-        metrics = run_policy(policy, data["conf1"], data["pred1"], data["pred2"], data["label"], tr, BUDGET_MS, NODE)
+        metrics = run_policy(policy, data["conf1"], data["pred1"], data["pred2"], data["label"], tr, budget, NODE)
         if _better(metrics, best):
             best = ((round(metrics["ontime_accuracy"], 5), round(metrics["accuracy"], 5), -metrics["timeout_rate"]), prm)
     return best[1]
 
 
-def score(policy, data, tr):
-    metrics = run_policy(policy, data["conf1"], data["pred1"], data["pred2"], data["label"], tr, BUDGET_MS, NODE)
-    return metrics
+def score(policy, data, tr, budget):
+    return run_policy(policy, data["conf1"], data["pred1"], data["pred2"], data["label"], tr, budget, NODE)
 
 
 def evaluate_seed(seed: int, timing: dict | None = None):
-    """Tune on validation and score on test for both regimes. Returns row dicts and the dynamic test series."""
+    """Tune on validation and score on test for every regime and budget."""
     if timing is None:
         timing = load_timing()[seed]
     val, test = load_seed(seed)
     rows = []
     series = None
     chosen = {}
-    for regime, val_stream, test_stream in (
-        ("stable", 10 + seed, 110 + seed),
-        ("dynamic", 20 + seed, 210 + seed),
-    ):
+    streams = {"stable": (10 + seed, 110 + seed), "moderate": (30 + seed, 310 + seed), "dynamic": (20 + seed, 210 + seed)}
+    for regime in REGIMES:
+        val_stream, test_stream = streams[regime]
         tr_val = trace_for(regime, len(val["label"]), timing, np.random.default_rng(val_stream))
         tr_test = trace_for(regime, len(test["label"]), timing, np.random.default_rng(test_stream))
-        tau = select_fixed(val, tr_val)
-        prm = select_la(val, tr_val)
-        chosen[regime] = {"tau_fixed": tau, **prm}
-        policies = [
-            Policy("full", "full"),
-            Policy("fixed", "fixed", tau=tau, feasibility=False),
-            Policy("latency_aware", "dynamic", **prm),
-        ]
-        for policy in policies:
-            metrics = score(policy, test, tr_test)
-            rows.append({
-                "seed": seed,
-                "regime": regime,
-                "budget_ms": BUDGET_MS,
-                "policy": policy.name,
-                "tau_fixed": tau if policy.name == "fixed" else "",
-                **_public(metrics),
-            })
-            if regime == "dynamic" and seed == 0:
-                if series is None:
-                    series = {
-                        "burst": np.array([link.bw_mbps < 20.0 for link in dynamic_link_sequence(len(test["label"]), np.random.default_rng(test_stream))], dtype=float),
-                        "budget_ms": BUDGET_MS,
-                    }
-                series[policy.name] = (metrics["_lat"] > BUDGET_MS).astype(float)
+        for level, budget in BUDGETS:
+            tau = select_fixed(val, tr_val, budget)
+            prm = select_la(val, tr_val, budget)
+            chosen[(regime, level)] = {"tau_fixed": tau, **prm}
+            policies = [
+                Policy("full", "full"),
+                Policy("fixed", "fixed", tau=tau, feasibility=False),
+                Policy("latency_aware", "dynamic", **prm),
+            ]
+            for policy in policies:
+                metrics = score(policy, test, tr_test, budget)
+                rows.append({
+                    "seed": seed,
+                    "regime": regime,
+                    "budget_level": level,
+                    "budget_ms": budget,
+                    "policy": policy.name,
+                    "tau_fixed": tau if policy.name == "fixed" else "",
+                    **_public(metrics),
+                })
+                if regime == "dynamic" and level == "tight" and seed == 0:
+                    if series is None:
+                        burst = dynamic_link_sequence(len(test["label"]), np.random.default_rng(test_stream))
+                        series = {
+                            "burst": np.array([link.bw_mbps < 20.0 for link in burst], dtype=float),
+                            "budget_ms": budget,
+                        }
+                    series[policy.name] = (metrics["_lat"] > budget).astype(float)
     return rows, chosen, series
 
 
@@ -177,10 +191,11 @@ def summarize(rows):
     metrics = ["accuracy", "ontime_accuracy", "deadline_hit_rate", "timeout_rate", "mean_latency_ms", "exit1_ratio"]
     groups = defaultdict(list)
     for row in rows:
-        groups[(row["regime"], row["policy"])].append(row)
+        groups[(row["regime"], row["budget_level"], row["policy"])].append(row)
     out = []
-    for (regime, policy), items in groups.items():
-        rec = {"regime": regime, "policy": policy, "budget_ms": BUDGET_MS, "n_seeds": len(items)}
+    for (regime, level, policy), items in groups.items():
+        rec = {"regime": regime, "budget_level": level, "policy": policy,
+               "budget_ms": items[0]["budget_ms"], "n_seeds": len(items)}
         for metric in metrics:
             values = np.array([item[metric] for item in items], dtype=float)
             rec[metric + "_mean"] = round(float(values.mean()), 5)
@@ -200,30 +215,32 @@ def make_figs(summary, series):
     order = ("full", "fixed", "latency_aware")
     names = {"full": "完整推理", "fixed": "固定阈值", "latency_aware": "时延感知"}
     colors = {"full": "#6b7280", "fixed": "#2563eb", "latency_aware": "#dc2626"}
-    regimes = ("stable", "dynamic")
-    regime_cn = {"stable": "稳定网络", "dynamic": "波动网络"}
-    lookup = {(r["regime"], r["policy"]): r for r in summary}
+    regime_cn = {"stable": "稳定", "moderate": "中等波动", "dynamic": "强波动"}
+    level_cn = {"tight": "紧\n12 ms", "mid": "中\n20 ms", "loose": "松\n80 ms"}
+    lookup = {(r["regime"], r["budget_level"], r["policy"]): r for r in summary}
+    levels = [level for level, _ in BUDGETS]
 
-    fig, axes = plt.subplots(1, 2, figsize=(10.2, 4.2))
-    x = np.arange(len(regimes))
-    for ax, metric, title, ylab in (
-        (axes[0], "ontime_accuracy", "按时正确率", "按时正确率 (%)"),
-        (axes[1], "deadline_hit_rate", "截止时间命中率", "命中率 (%)"),
-    ):
-        for j, policy in enumerate(order):
-            means = [lookup[(regime, policy)][metric + "_mean"] * 100 for regime in regimes]
-            stds = [lookup[(regime, policy)][metric + "_std"] * 100 for regime in regimes]
-            ax.bar(x + (j - 1) * 0.25, means, 0.25, yerr=stds, capsize=3, color=colors[policy], label=names[policy])
-        ax.set_xticks(x)
-        ax.set_xticklabels([regime_cn[r] for r in regimes])
-        ax.set_ylabel(ylab)
-        ax.set_title(title)
-        ax.set_ylim(0, 108)
-        ax.grid(axis="y", alpha=0.3)
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=3, bbox_to_anchor=(0.5, -0.14), frameon=False, fontsize=8)
-    fig.suptitle(f"预算 {BUDGET_MS:.0f} ms，验证集选参后在测试集上的 3 个种子均值")
-    _save(fig, "fig_stable_vs_dynamic.png")
+    fig, axes = plt.subplots(2, 3, figsize=(12.2, 7.2), sharey="row")
+    x = np.arange(len(levels))
+    for col, regime in enumerate(REGIMES):
+        for row, (metric, title) in enumerate((("ontime_accuracy", "按时正确率 (%)"), ("deadline_hit_rate", "截止命中率 (%)"))):
+            ax = axes[row, col]
+            for j, policy in enumerate(order):
+                means = [lookup[(regime, level, policy)][metric + "_mean"] * 100 for level in levels]
+                stds = [lookup[(regime, level, policy)][metric + "_std"] * 100 for level in levels]
+                ax.bar(x + (j - 1) * 0.25, means, 0.25, yerr=stds, capsize=2, color=colors[policy], label=names[policy])
+            ax.set_xticks(x)
+            ax.set_xticklabels([level_cn[level] for level in levels])
+            ax.set_ylim(0, 112)
+            ax.grid(axis="y", alpha=0.3)
+            if row == 0:
+                ax.set_title(regime_cn[regime])
+            if col == 0:
+                ax.set_ylabel(title)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=3, bbox_to_anchor=(0.5, -0.08), frameon=False, fontsize=9)
+    fig.suptitle("验证集选参后的测试集结果（3 个种子均值）")
+    _save(fig, "fig_regime_budget.png")
 
     fig, ax = plt.subplots(figsize=(11, 3.8))
     burst = series["burst"]
@@ -235,7 +252,7 @@ def make_figs(summary, series):
         ax.plot(rolled, color=color, lw=1.2, label=names[policy])
     ax.set_xlabel("测试样本序号")
     ax.set_ylabel("滑动超时率 (%)，窗口 200")
-    ax.set_title("波动网络下的滑动超时率（种子 0）")
+    ax.set_title(f"强波动网络、紧预算 {series['budget_ms']:.0f} ms 的滑动超时率（种子 0）")
     ax.legend(fontsize=8, ncol=3)
     ax.grid(alpha=0.3)
     _save(fig, "fig_dynamic_timeout_trace.png")
@@ -250,18 +267,19 @@ def main():
     for seed in SEEDS:
         seed_rows, chosen, seed_series = evaluate_seed(seed, timing[seed])
         rows.extend(seed_rows)
-        for regime, prm in chosen.items():
-            params.append({"seed": seed, "regime": regime, "budget_ms": BUDGET_MS, **prm})
+        for (regime, level), prm in chosen.items():
+            budget = dict(BUDGETS)[level]
+            params.append({"seed": seed, "regime": regime, "budget_level": level, "budget_ms": budget, **prm})
         if seed_series is not None:
             series = seed_series
     summary = summarize(rows)
-    write_csv("stable_vs_dynamic_per_seed.csv", rows)
-    write_csv("stable_vs_dynamic_summary.csv", summary)
+    write_csv("regime_budget_per_seed.csv", rows)
+    write_csv("regime_budget_summary.csv", summary)
     write_csv("params_selected.csv", params)
     make_figs(summary, series)
     for row in summary:
         print(
-            f"{row['regime']:8} {row['policy']:16} "
+            f"{row['regime']:9} {row['budget_level']:6} {row['policy']:16} "
             f"ontime={row['ontime_accuracy_mean']:.4f} hit={row['deadline_hit_rate_mean']:.4f} "
             f"acc={row['accuracy_mean']:.4f}"
         )
